@@ -3,7 +3,6 @@ package p2p
 import (
 	"fmt"
 	"net"
-	"sync"
 )
 
 type TCPPeer struct {
@@ -23,25 +22,35 @@ func NewTCPPeer(conn net.Conn, outbound bool) *TCPPeer {
 	}
 }
 
+// Close implements the Peer interface
+func (t *TCPPeer) Close() error {
+	return t.conn.Close()
+}
+
 type TCPTransportOpts struct {
 	ListenAddr		string
 	HandshakeFunc	HandshakeFunc
 	Decoder			Decoder
+	OnPeer 			func(Peer) error
 }
 
 type TCPTransport struct {
 	TCPTransportOpts
 	listener      	net.Listener
-
-	// common practice in golang to put mutex above the thing you want to protect
-	mu            	sync.RWMutex
-	peers		  	map[net.Addr]Peer
+	rpcch         	chan RPC
 }
 
 func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
 	return &TCPTransport{
-		TCPTransportOpts: opts,
+		TCPTransportOpts: 	opts,
+		rpcch: 				make(chan RPC),
 	}
+}
+
+// Consume implements the Transport interface, which will return read-only channel
+// for reading the incoming messages received from another peer in the network.
+func (t *TCPTransport) Consume() <- chan RPC {
+	return t.rpcch
 }
 
 func (t *TCPTransport) ListenAndAccept() error {
@@ -70,23 +79,42 @@ func (t *TCPTransport) startAcceptLoop() {
 	}
 }
 
-type Temp struct{}
-
 func (t *TCPTransport) handleConn(conn net.Conn) {
+	var err error
+
+	defer func () {
+		fmt.Printf("dropping peer connection: %s\n", err)
+		conn.Close()
+	}()
+
 	peer := NewTCPPeer(conn, true)
 
 	if err := t.HandshakeFunc(peer); err != nil {
-		conn.Close()
-		fmt.Printf("TCP handshake error: %s\n", err)
 		return
 	}
 
-	// Read Loop
-	msg := &Temp{}
-	for {
-		if err := t.Decoder.Decode(conn, msg); err != nil {
-			fmt.Printf("TCP error: %s\n", err)
-			continue
+	if t.OnPeer != nil {
+		if err := t.OnPeer(peer); err != nil {
+			return
 		}
 	}
+
+	// Read Loop
+	rpc := RPC{}
+	for {
+		err = t.Decoder.Decode(conn, &rpc)
+		if err != nil {
+			return 
+		}
+
+		rpc.From = conn.RemoteAddr()
+		t.rpcch <- rpc
+
+		fmt.Printf("RPC: %+v\n", rpc)
+	}
 }
+
+
+// common practice in golang to put mutex above the thing you want to protect
+	// mu            	sync.RWMutex
+	// peers		  	map[net.Addr]Peer
